@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, Body
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Any
 from keybert import KeyBERT
 import fitz
 from summa import keywords as summa_keywords
@@ -31,8 +31,9 @@ def extract_keywords_keybert(text: str, top_n: int) -> list:
 
 # Summa 라이브러리를 사용한 TextRank 키워드 추출
 def extract_keywords_textrank_summa(text: str, top_n: int) -> list:
-    tr_keywords = summa_keywords.keywords(text, words=top_n, scores=True)
-    return [(kw, round(score, 4)) for kw, score in tr_keywords]
+    # tr_keywords = summa_keywords.keywords(text, words=top_n, scores=True)
+    tr_keywords = summa_keywords.keywords(text, scores=True)
+    return [(kw, round(score, 4)) for kw, score in tr_keywords][:top_n]
 
 # 논문 데이터 모델 정의
 class Paper(BaseModel):
@@ -52,9 +53,8 @@ class SaveWeaResponse(BaseModel):
     resultCode: int
     data: Dict[str, str]
 
-# 논문 데이터 불러오는 API 엔드포인트
-@app.get("/getMeta", response_model=MetaResponse)
-async def get_meta(searchword: str = Query(..., description="Search term for arXiv API")):
+# 논문 데이터 불러오는 함수
+def fetch_meta_data(searchword: str) -> Dict[str, Any]:
     text = searchword.replace(" ", "+")
     base_url = f"http://export.arxiv.org/api/query?search_query=ti:{text}+OR+abs:{text}&sortBy=relevance&sortOrder=descending&start=0&max_results=15"
 
@@ -83,6 +83,11 @@ async def get_meta(searchword: str = Query(..., description="Search term for arX
 
     return {"resultCode": 200, "data": papers}
 
+# 논문 데이터 불러오는 API 엔드포인트
+@app.get("/getMeta", response_model=MetaResponse)
+async def get_meta(searchword: str = Query(..., description="Search term for arXiv API")):
+    return fetch_meta_data(searchword)
+
 # 논문 데이터 저장하는 API 엔드포인트
 @app.post("/saveWea", response_model=SaveWeaResponse)
 async def save_wea(meta_response: MetaResponse = Body(...)) -> SaveWeaResponse:
@@ -92,9 +97,7 @@ async def save_wea(meta_response: MetaResponse = Body(...)) -> SaveWeaResponse:
         # 여기에 데이터베이스 저장 로직을 추가하세요.
         for paper in papers:
             # title 중복 확인
-            # 예시 코드: response = collection.find_one({"title": paper["title"]})
             response = None  # 중복 확인 로직을 여기에 추가하세요.
-            # object가 있으면 건너뛰기
             if response:
                 continue
             
@@ -115,12 +118,22 @@ async def save_wea(meta_response: MetaResponse = Body(...)) -> SaveWeaResponse:
     except Exception as e:
         return {"resultCode": 500, "data": {"message": str(e)}}
 
+def fetch_pdf_text(pdf_url: str) -> str:
+    response = requests.get(pdf_url)
+    with open("/tmp/paper.pdf", "wb") as f:
+        f.write(response.content)
+    return pdf_to_text("/tmp/paper.pdf")
+
 # 논문 데이터 중 하나를 선택하여 키워드 추출하는 API 엔드포인트
 @app.get("/extractKeywords")
-async def extract_keywords_from_paper(searchword: str, title: str, top_n: int = 5):
-    meta_response = await get_meta(searchword)
+async def extract_keywords_from_paper(searchword: str, title: str, top_n: int = 20):
+    meta_response = fetch_meta_data(searchword)
     if meta_response["resultCode"] != 200 or not meta_response["data"]:
         raise HTTPException(status_code=500, detail="Failed to fetch data from arXiv API")
+
+    # 논문 목록 출력 (디버깅 용도)
+    for p in meta_response["data"]:
+        print(f"Title: {p['title']}")
 
     paper = next((p for p in meta_response["data"] if p["title"] == title), None)
     if not paper:
@@ -128,8 +141,12 @@ async def extract_keywords_from_paper(searchword: str, title: str, top_n: int = 
 
     text = paper["summary"]
 
-    kb_keywords = extract_keywords_keybert(text, top_n)
-    tr_keywords_summa = extract_keywords_textrank_summa(text, top_n)
+    # PDF 내용 추출
+    if paper["pdf_link"]:
+        text = fetch_pdf_text(paper["pdf_link"])
+
+    kb_keywords = extract_keywords_keybert(text, top_n=top_n)
+    tr_keywords_summa = extract_keywords_textrank_summa(text, top_n=top_n)
 
     return {
         "title": paper["title"],
