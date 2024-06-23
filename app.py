@@ -1,162 +1,125 @@
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-from typing import List, Dict, Any
 from keybert import KeyBERT
-import fitz
 from summa import keywords as summa_keywords
 import nltk
+import fitz  # PyMuPDF
 from nltk.corpus import stopwords
-import requests
-import feedparser
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from sklearn.feature_extraction.text import TfidfVectorizer
+from gensim import corpora, models
+import logging
+import re
 
 nltk.download('stopwords')
-stop_words = set(stopwords.words('english'))
+stop_words = list(set(stopwords.words('english')).union(set(ENGLISH_STOP_WORDS)))
+
+logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI()
 
-# PDF를 텍스트로 변환
-def pdf_to_text(pdf_path: str) -> str:
-    pdf_document = fitz.open(pdf_path)
-    text = ""
-    for page_num in range(pdf_document.page_count):
-        page = pdf_document.load_page(page_num)
-        text += page.get_text()
+class TextRequest(BaseModel):
+    text: str = None
+    pdf_path: str = None
+
+default_pdf_path = '1910.14296v2.pdf'
+
+def pdf_to_text(pdf_path):
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        logging.debug(f"PDF에서 추출된 텍스트 길이: {len(text)}")
+        return text
+    except Exception as e:
+        logging.error(f"PDF에서 텍스트를 추출하는 중 오류 발생: {e}")
+        raise HTTPException(status_code=500, detail="PDF 파일에서 텍스트를 추출하는 데 실패했습니다.")
+
+def preprocess_text(text):
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\s]', '', text)
+    text = text.strip().lower()
     return text
 
-# KeyBERT 키워드 추출
-def extract_keywords_keybert(text: str, top_n: int) -> list:
-    model = KeyBERT()
-    kb_keywords = model.extract_keywords(text, keyphrase_ngram_range=(1, 1), stop_words='english', top_n=top_n)
-    return kb_keywords
-
-# Summa 라이브러리를 사용한 TextRank 키워드 추출
-def extract_keywords_textrank_summa(text: str, top_n: int) -> list:
-    tr_keywords = summa_keywords.keywords(text, words=top_n, scores=True)
-    return [(kw, round(score, 4)) for kw, score in tr_keywords][:top_n]
-
-# 논문 데이터 모델 정의
-class Paper(BaseModel):
-    title: str
-    authors: List[str]
-    summary: str
-    published: str
-    direct_link: str
-    pdf_link: str
-    category: str
-
-class MetaResponse(BaseModel):
-    resultCode: int
-    data: List[Paper]
-
-class SaveWeaResponse(BaseModel):
-    resultCode: int
-    data: Dict[str, str]
-
-# 논문 데이터 불러오는 API 엔드포인트
-@app.get("/getMeta")
-async def get_meta(searchword: str = Query(..., description="Search term for arXiv API")) -> Dict[str, Any]:
-    text = searchword.replace(" ", "+")
-    base_url = f"http://export.arxiv.org/api/query?search_query=ti:{text}+OR+abs:{text}&sortBy=relevance&sortOrder=descending&start=0&max_results=15"
-
-    response = requests.get(base_url)
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch data from arXiv API")
+def extract_keywords_keybert(text, top_n=5, keyphrase_ngram_range=(1, 3), use_maxsum=False, nr_candidates=20, diversity=0.5):
+    text = preprocess_text(text)
+    if len(text.split()) < 10:
+        logging.debug("텍스트가 너무 짧아 키워드 추출이 불가능합니다.")
+        return []
     
-    feed = feedparser.parse(response.content)
-    papers = []
-
-    for entry in feed.entries:
-        link = entry.links[0]['href'] if entry.links else None
-        pdf_link = entry.links[1]['href'] if len(entry.links) > 1 else None
-        category = entry.arxiv_primary_category['term'] if 'arxiv_primary_category' in entry else None
-
-        paper = {
-            "title": entry.title,
-            "authors": [author.name for author in entry.authors],
-            "summary": entry.summary,
-            "published": entry.published,
-            "direct_link": link,
-            "pdf_link": pdf_link,
-            "category": category
-        }
-        papers.append(paper)
-
-    return {
-        "resultCode": 200,
-        "data": papers
-    }
-
-# 논문 데이터 저장하는 API 엔드포인트
-@app.post("/saveWea", response_model=SaveWeaResponse)
-async def save_wea(meta_response: MetaResponse = Body(...)) -> SaveWeaResponse:
-    papers = meta_response.data
-
+    model = KeyBERT('all-MiniLM-L6-v2')
     try:
-        with collection.batch.fixed_size(5) as batch:
-            for paper in papers:
-                # title 중복 확인
-                response = collection.query.fetch_objects(
-                    filters=Filter.by_property("title").equal(paper.title),
-                    limit=1
-                )
-                # object가 있으면 건너뛰기
-                if response.objects:
-                    continue
-                
-                properties = {
-                    "title": paper.title,
-                    "authors": paper.authors,
-                    "summary": paper.summary,
-                    "published": paper.published,
-                    "direct_link": paper.direct_link,
-                    "pdf_link": paper.pdf_link,
-                    "category": paper.category,
-                }
-
-                batch.add_object(
-                    properties=properties,
-                )
-        return SaveWeaResponse(resultCode=200, data={"message": "데이터 저장이 완료되었습니다."})
+        keywords = model.extract_keywords(text, keyphrase_ngram_range=keyphrase_ngram_range, top_n=top_n, use_maxsum=use_maxsum, diversity=diversity)
+        logging.debug(f"KeyBERT에서 추출된 키워드: {keywords}")
+        return keywords
     except Exception as e:
-        return SaveWeaResponse(resultCode=500, data={"message": str(e)})
+        logging.error(f"KeyBERT 키워드 추출 중 오류 발생: {e}")
+        return []
 
-def fetch_pdf_text(pdf_url: str) -> str:
-    response = requests.get(pdf_url)
-    with open("/tmp/paper.pdf", "wb") as f:
-        f.write(response.content)
-    return pdf_to_text("/tmp/paper.pdf")
+def extract_keywords_textrank(text, top_n=5):
+    text = preprocess_text(text)
+    try:
+        textrank_keywords = summa_keywords.keywords(text, words=top_n, scores=True)
+        return textrank_keywords
+    except Exception as e:
+        logging.error(f"TextRank 키워드 추출 중 오류 발생: {e}")
+        return []
 
-# 논문 데이터 중 하나를 선택하여 키워드 추출하는 API 엔드포인트
-@app.get("/extractKeywords")
-async def extract_keywords_from_paper(searchword: str, title: str, top_n: int = 20):
-    meta_response = await get_meta(searchword)
-    if meta_response["resultCode"] != 200 or not meta_response["data"]:
-        raise HTTPException(status_code=500, detail="Failed to fetch data from arXiv API")
+def extract_keywords_tfidf(text, top_n=5):
+    vectorizer = TfidfVectorizer(stop_words=stop_words)
+    tfidf_matrix = vectorizer.fit_transform([text])
+    feature_array = vectorizer.get_feature_names_out()
+    tfidf_sorting = tfidf_matrix.toarray().flatten().argsort()[-top_n:]
+    top_keywords = [(feature_array[i], tfidf_matrix[0, i]) for i in tfidf_sorting]
+    return top_keywords
 
-    # 논문 목록 출력 (디버깅 용도)
-    for p in meta_response["data"]:
-        print(f"Title: {p['title']}")
+def extract_keywords_lda(text, top_n=5, num_topics=1):
+    processed_text = preprocess_text(text)
+    words = processed_text.split()
+    dictionary = corpora.Dictionary([words])
+    corpus = [dictionary.doc2bow(words)]
+    lda_model = models.LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=15)
+    topics = lda_model.show_topics(formatted=False)
+    top_keywords = [(word, float(prob)) for word, prob in topics[0][1]][:top_n]
+    return top_keywords
 
-    paper = next((p for p in meta_response["data"] if p["title"] == title), None)
-    if not paper:
-        raise HTTPException(status_code=404, detail="Paper not found")
+@app.post("/Bert_Keyword")
+async def bert_keyword(request: TextRequest = Body(None), top_n: int = 5):
+    if request and (request.text or request.pdf_path):
+        text = request.text if request.text else pdf_to_text(request.pdf_path)
+    else:
+        text = pdf_to_text(default_pdf_path)
+    keybert_keywords = extract_keywords_keybert(text, top_n=top_n)
+    return {"keybert_keywords": keybert_keywords}
 
-    text = paper["summary"]
+@app.post("/TextRank_Keyword")
+async def textrank_keyword(request: TextRequest = Body(None), top_n: int = 5):
+    if request and (request.text or request.pdf_path):
+        text = request.text if request.text else pdf_to_text(request.pdf_path)
+    else:
+        text = pdf_to_text(default_pdf_path)
+    textrank_keywords = extract_keywords_textrank(text, top_n=top_n)
+    return {"textrank_keywords": textrank_keywords}
 
-    # PDF 내용 추출
-    if paper["pdf_link"]:
-        text = fetch_pdf_text(paper["pdf_link"])
+@app.post("/TFIDF_Keyword")
+async def tfidf_keyword(request: TextRequest = Body(None), top_n: int = 5):
+    if request and (request.text or request.pdf_path):
+        text = request.text if request.text else pdf_to_text(request.pdf_path)
+    else:
+        text = pdf_to_text(default_pdf_path)
+    tfidf_keywords = extract_keywords_tfidf(text, top_n=top_n)
+    return {"tfidf_keywords": tfidf_keywords}
 
-    kb_keywords = extract_keywords_keybert(text, top_n=top_n)
-    tr_keywords_summa = extract_keywords_textrank_summa(text, top_n=top_n)
-
-    return {
-        "title": paper["title"],
-        "summary": paper["summary"],
-        "keybert_keywords": {keyword: score for keyword, score in kb_keywords},
-        "textrank_keywords_summa": {keyword: score for keyword, score in tr_keywords_summa}
-    }
+@app.post("/LDA_Keyword")
+async def lda_keyword(request: TextRequest = Body(None), top_n: int = 5):
+    if request and (request.text or request.pdf_path):
+        text = request.text if request.text else pdf_to_text(request.pdf_path)
+    else:
+        text = pdf_to_text(default_pdf_path)
+    lda_keywords = extract_keywords_lda(text, top_n=top_n)
+    return {"lda_keywords": lda_keywords}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
